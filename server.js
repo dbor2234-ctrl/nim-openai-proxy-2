@@ -14,7 +14,7 @@ const NIM_BASE = 'https://integrate.api.nvidia.com/v1';
 const DEFAULT_MODEL = 'moonshotai/kimi-k3.1-pro';
 const MODEL_MAP = {
   'gpt-3.5-turbo': 'deepseek-ai/deepseek-v4.1-flash',
-  'gpt-4':         'moonshotai/kimi-k3',
+  'gpt-4':         'minimaxai/minimax-m3.1-flash',
   'gpt-4-turbo':  'z-ai/glm-5.3-flash',
   'gpt-4o':        'moonshotai/kimi-k3.1-pro'
 };
