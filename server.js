@@ -37,7 +37,7 @@ app.get('/v1/models', (req, res) => {
 });
 
 app.post('/v1/chat/completions', async (req, res) => {
-    const startedAt = Date.now();
+  const startedAt = Date.now();
   if (!checkAuth(req, res)) return;
   if (!NIM_API_KEY) return res.status(500).json({ error: { message: 'NIM_API_KEY not set' } });
 
@@ -49,10 +49,12 @@ app.post('/v1/chat/completions', async (req, res) => {
   const payload = {
     model: nimModel,
     messages: body.messages,
-    temperature: body.temperature ?? 1,
+    temperature: body.temperature ?? 0.9,
     top_p: body.top_p ?? 0.95,
     max_tokens: body.max_tokens ?? 208000,
-    stream: isStream
+    stream: isStream,
+    // Request usage data in streaming mode too
+    ...(isStream && { stream_options: { include_usage: true } })
   };
 
   try {
@@ -69,12 +71,45 @@ app.post('/v1/chat/completions', async (req, res) => {
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-      nimRes.body.pipe(res);
+
+      let usageStats = null;
+
+      // Instead of direct pipe, iterate through chunks to capture usage stats
+      for await (const chunk of nimRes.body) {
+        res.write(chunk);
+
+        const text = chunk.toString();
+        const lines = text.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('data: ') && line !== 'data: [DONE]') {
+            try {
+              const parsed = JSON.parse(line.substring(6));
+              if (parsed.usage) {
+                usageStats = parsed.usage;
+              }
+            } catch (e) {
+              // Ignore JSON parse errors on partial chunk lines
+            }
+          }
+        }
+      }
+
+      console.log(`[timing] Stream finished in ${Date.now() - startedAt}ms`);
+      if (usageStats) {
+        console.log(`[tokens] Streamed -> Prompt: ${usageStats.prompt_tokens} | Completion: ${usageStats.completion_tokens} | Total: ${usageStats.total_tokens}`);
+      }
+
+      res.end();
       return;
     }
 
     const data = await nimRes.json();
     console.log(`[timing] NIM responded in ${Date.now() - startedAt}ms`);
+    
+    if (data.usage) {
+      console.log(`[tokens] Non-streamed -> Prompt: ${data.usage.prompt_tokens} | Completion: ${data.usage.completion_tokens} | Total: ${data.usage.total_tokens}`);
+    }
+
     res.status(nimRes.status).json(data);
   } catch (err) {
     res.status(500).json({ error: { message: err.message } });
