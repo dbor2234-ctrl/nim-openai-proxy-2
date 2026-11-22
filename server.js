@@ -36,7 +36,7 @@ const KEY_STRATEGY = (process.env.KEY_STRATEGY || 'round-robin').toLowerCase();
 const COOLDOWN_MS = Number(process.env.KEY_COOLDOWN_MS || 2000);   // park a key 2s after 429 / network error
 const DEAD_KEY_MS = 10 * 60 * 1000;                                // park a dead key (401/402/403) 10 min
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 300);  // pause between key attempts
-const HEADER_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 500000); // wait max 5 min for upstream answer
+const HEADER_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 500000); 
 const MAX_ATTEMPTS_RAW = parseInt(process.env.MAX_KEY_ATTEMPTS, 10) || KEYS.length;
 
 // statuses meaning "this key can't serve right now -> try another one"
