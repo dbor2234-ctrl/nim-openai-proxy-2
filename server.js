@@ -19,7 +19,7 @@ const MODEL_MAP = {
 };
 
 /* ============================================================
- * NEW: MULTI-KEY POOL + ROTATION + AUTOMATIC FAILOVER
+ * MULTI-KEY POOL + ROTATION + AUTOMATIC FAILOVER
  * ------------------------------------------------------------
  * On Railway set ONE variable (comma-separated, spaces ignored):
  *   NIM_API_KEYS = nvapi-xxxxxxxx,nvapi-yyyyyyyy,nvapi-zzzzzzzz
@@ -36,8 +36,9 @@ const KEY_STRATEGY = (process.env.KEY_STRATEGY || 'round-robin').toLowerCase();
 const COOLDOWN_MS = Number(process.env.KEY_COOLDOWN_MS || 2000);   // park a key 2s after 429 / network error
 const DEAD_KEY_MS = 10 * 60 * 1000;                                // park a dead key (401/402/403) 10 min
 const RETRY_DELAY_MS = Number(process.env.RETRY_DELAY_MS || 300);  // pause between key attempts
-const HEADER_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 1000000); 
-const MAX_ATTEMPTS_RAW = parseInt(process.env.MAX_KEY_ATTEMPTS, 20) || KEYS.length;
+const HEADER_TIMEOUT_MS = Number(process.env.UPSTREAM_TIMEOUT_MS || 1000000);
+// FIXED: radix was 20, must be 10
+const MAX_ATTEMPTS_RAW = parseInt(process.env.MAX_KEY_ATTEMPTS, 10) || KEYS.length;
 
 // statuses meaning "this key can't serve right now -> try another one"
 const KEY_SPECIFIC = new Set([401, 402, 403]);            // invalid / out of credits / suspended
@@ -81,6 +82,148 @@ function pickKey() {
 }
 /* ============================================================ */
 
+/* USAGE-START */
+/* ============================================================
+ * TOKEN USAGE (input / output) - logged AND shown in every message
+ * ------------------------------------------------------------
+ * SHOW_USAGE_IN_CHAT=false  -> only log to console, don't touch the reply
+ * If the model doesn't report usage, a rough estimate (~4 chars/token)
+ * is used and marked with "~" and "(estimated)".
+ * ============================================================ */
+const SHOW_USAGE_IN_CHAT = (process.env.SHOW_USAGE_IN_CHAT || 'true').toLowerCase() !== 'false';
+
+const estimateTokens = chars => Math.ceil(chars / 4);
+
+function messagesChars(messages) {
+  return (Array.isArray(messages) ? messages : []).reduce((sum, m) => {
+    const c = m && m.content;
+    return sum + (typeof c === 'string' ? c.length : JSON.stringify(c ?? '').length);
+  }, 0);
+}
+
+function normalizeUsage(usage, inChars, outChars) {
+  if (usage && (usage.prompt_tokens != null || usage.completion_tokens != null)) {
+    const p = usage.prompt_tokens ?? 0;
+    const c = usage.completion_tokens ?? 0;
+    return { prompt: p, completion: c, total: usage.total_tokens ?? p + c, estimated: false };
+  }
+  const p = estimateTokens(inChars);
+  const c = estimateTokens(outChars);
+  return { prompt: p, completion: c, total: p + c, estimated: true };
+}
+
+function usageFooter(u) {
+  const a = u.estimated ? '~' : '';
+  return `\n\n---\n📊 Tokens: ${a}${u.prompt} in / ${a}${u.completion} out / ${a}${u.total} total${u.estimated ? ' (estimated)' : ''}`;
+}
+
+function logUsage(u, model) {
+  console.log(`[tokens] ${model} | input: ${u.prompt} | output: ${u.completion} | total: ${u.total}${u.estimated ? ' (estimated)' : ''}`);
+}
+
+// Streams NIM's SSE response to the client, and right before the end injects
+// one extra chunk containing the token footer. Everything else passes through untouched.
+function pipeStreamWithUsage(nimRes, res, { model, inChars }) {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  if (res.flushHeaders) res.flushHeaders();
+
+  let buf = '';
+  let rawUsage = null;
+  let outChars = 0;
+  let held = null;        // finish_reason chunk, held back so the footer lands BEFORE it
+  let footerSent = false;
+  let doneSent = false;
+  const meta = { id: 'chatcmpl-proxy', created: Math.floor(Date.now() / 1000), model };
+
+  const writeData = s => res.write(`data: ${s}\n\n`);
+  const flushHeld = () => { if (held !== null) { writeData(held); held = null; } };
+
+  const sendFooter = () => {
+    if (footerSent) return;
+    footerSent = true;
+    const u = normalizeUsage(rawUsage, inChars, outChars);
+    logUsage(u, model);
+    if (!SHOW_USAGE_IN_CHAT) return;
+    writeData(JSON.stringify({
+      id: meta.id,
+      object: 'chat.completion.chunk',
+      created: meta.created,
+      model: meta.model,
+      choices: [{ index: 0, delta: { content: usageFooter(u) }, finish_reason: null }]
+    }));
+  };
+
+  const finish = () => {
+    if (doneSent) return;
+    doneSent = true;
+    sendFooter();
+    flushHeld();
+    writeData('[DONE]');
+    res.end();
+  };
+
+  const handleEvent = block => {
+    const dataLines = block.split('\n').filter(l => l.startsWith('data:'));
+    if (!dataLines.length) { res.write(block + '\n\n'); return; } // comments / keep-alives
+
+    const raw = dataLines.map(l => l.slice(5).trim()).join('\n');
+    if (raw === '[DONE]') { finish(); return; }
+
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch { res.write(block + '\n\n'); return; }
+
+    if (parsed.id) meta.id = parsed.id;
+    if (parsed.created) meta.created = parsed.created;
+    if (parsed.model) meta.model = parsed.model;
+    if (parsed.usage) rawUsage = parsed.usage;
+
+    const choice = parsed.choices && parsed.choices[0];
+
+    // usage-only chunk (empty choices): swallow it and put our footer in its place
+    if (!choice) {
+      if (parsed.usage) { sendFooter(); flushHeld(); } else writeData(raw);
+      return;
+    }
+
+    const d = choice.delta || {};
+    outChars += (typeof d.content === 'string' ? d.content.length : 0)
+              + (typeof d.reasoning_content === 'string' ? d.reasoning_content.length : 0);
+
+    if (choice.finish_reason) {
+      if (parsed.usage) { sendFooter(); flushHeld(); writeData(raw); }
+      else { flushHeld(); held = raw; } // wait: usage chunk usually follows
+      return;
+    }
+
+    writeData(raw);
+  };
+
+  nimRes.body.setEncoding('utf8'); // safe handling of multi-byte characters across chunks
+  nimRes.body.on('data', chunk => {
+    buf = (buf + chunk).replace(/\r\n/g, '\n');
+    let i;
+    while ((i = buf.indexOf('\n\n')) !== -1) {
+      const block = buf.slice(0, i);
+      buf = buf.slice(i + 2);
+      if (block.trim()) handleEvent(block);
+    }
+  });
+  nimRes.body.on('end', () => {
+    if (buf.trim()) handleEvent(buf);
+    buf = '';
+    finish();
+  });
+  nimRes.body.on('error', err => {
+    console.log(`[stream] upstream stream error: ${err.message}`);
+    if (!res.writableEnded) res.end();
+  });
+  res.on('close', () => nimRes.body.destroy()); // client left -> stop pulling from NIM
+}
+/* USAGE-END */
+
 function checkAuth(req, res) {
   if (!PROXY_KEY) return true;
   const auth = req.headers.authorization || '';
@@ -95,7 +238,7 @@ app.get('/health', (req, res) => res.json({
   keysReady: pool.filter(k => k.cooldownUntil <= Date.now()).length
 }));
 
-// NEW: live status of every key (masked) so you can see who is rate-limited
+// live status of every key (masked) so you can see who is rate-limited
 app.get('/keys', (req, res) => {
   if (!checkAuth(req, res)) return;
   const now = Date.now();
@@ -126,6 +269,7 @@ app.post('/v1/chat/completions', async (req, res) => {
   const body = req.body || {};
   const nimModel = MODEL_MAP[body.model] || DEFAULT_MODEL;
   const isStream = !!body.stream;
+  const inChars = messagesChars(body.messages); // used only for the fallback estimate
   console.log(`[request] JanitorAI asked for "${body.model}" -> using NIM model "${nimModel}"${isStream ? ' (stream)' : ''}`);
 
   const payload = {
@@ -134,7 +278,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     temperature: body.temperature ?? 1,
     top_p: body.top_p ?? 0.95,
     max_tokens: body.max_tokens ?? 208000,
-    stream: isStream
+    stream: isStream,
+    // ask NIM to send token counts at the end of a stream
+    ...(isStream && { stream_options: { include_usage: true } })
   };
   const payloadStr = JSON.stringify(payload); // built once, reused on every retry
 
@@ -161,7 +307,7 @@ app.post('/v1/chat/completions', async (req, res) => {
       });
       clearTimeout(timer);
 
-      // NEW: key is rate-limited / dead -> park it and retry on the next key
+      // key is rate-limited / dead -> park it and retry on the next key
       if (KEY_SPECIFIC.has(nimRes.status) || TRANSIENT.has(nimRes.status)) {
         const reason = KEY_SPECIFIC.has(nimRes.status)
           ? `key problem (HTTP ${nimRes.status})`
@@ -191,15 +337,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 
       if (isStream) {
         // headers are verified OK (not 429/5xx), so the stream is safe to pipe
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        nimRes.body.pipe(res);
+        pipeStreamWithUsage(nimRes, res, { model: nimModel, inChars });
         return;
       }
 
       const data = await nimRes.json();
       console.log(`[timing] NIM responded in ${Date.now() - startedAt}ms`);
+
+      const msg = data.choices && data.choices[0] && data.choices[0].message;
+      const outChars = msg
+        ? (typeof msg.content === 'string' ? msg.content.length : 0)
+          + (typeof msg.reasoning_content === 'string' ? msg.reasoning_content.length : 0)
+        : 0;
+      const u = normalizeUsage(data.usage, inChars, outChars);
+      logUsage(u, nimModel);
+      if (SHOW_USAGE_IN_CHAT && msg && typeof msg.content === 'string') {
+        msg.content += usageFooter(u);
+      }
+
       res.status(nimRes.status).json(data);
       return;
 
